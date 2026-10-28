@@ -1,0 +1,163 @@
+Sub RestoreFromText()
+    Dim fPath As Variant, stm As Object, txt As String
+    Dim lines() As String, cols() As String, i As Long, k As Long
+    Dim wb As Workbook, ws As Worksheet, rng As Range
+    Dim names As Object, nm As Variant, prev As Worksheet
+    Dim parts() As String, p() As String, fml As String
+    Dim merges As Collection, m As Variant, a() As String
+    
+    Set wb = ActiveWorkbook
+    fPath = Application.GetOpenFilename("テキスト (*.txt;*.tsv),*.txt;*.tsv", , "復元するファイルを選択")
+    If fPath = False Then Exit Sub
+    If MsgBox("「" & wb.Name & "」の内容を選択したファイルの内容で置き換えます。よろしいですか？", _
+              vbOKCancel + vbExclamation) <> vbOK Then Exit Sub
+    
+    ' UTF-8で読み込む
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "UTF-8"
+    stm.Open
+    stm.LoadFromFile fPath
+    txt = stm.ReadText
+    stm.Close
+    
+    ' 改行コードの違い（CRLF／LF）を吸収する
+    txt = Replace(txt, vbCrLf, vbLf)
+    txt = Replace(txt, vbCr, vbLf)
+    lines = Split(txt, vbLf)
+    
+    ' シート名を出てくる順に集める
+    Set names = CreateObject("Scripting.Dictionary")
+    For i = 1 To UBound(lines)
+        If Len(lines(i)) > 0 Then
+            cols = Split(lines(i), vbTab)
+            If UBound(cols) >= 2 Then
+                If Not names.Exists(cols(0)) Then names.Add cols(0), True
+            End If
+        End If
+    Next i
+    If names.Count = 0 Then
+        MsgBox "ファイルにデータがありません。", vbExclamation
+        Exit Sub
+    End If
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.DisplayAlerts = False
+    
+    ' 1. シートを用意する
+    For Each nm In names.Keys
+        Set ws = Nothing
+        On Error Resume Next
+        Set ws = wb.Worksheets(CStr(nm))
+        On Error GoTo 0
+        If ws Is Nothing Then
+            Set ws = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+            ws.Name = CStr(nm)
+        Else
+            ws.Cells.Clear
+            ws.Cells.UnMerge
+        End If
+        If prev Is Nothing Then
+            ws.Move Before:=wb.Sheets(1)
+        Else
+            ws.Move After:=prev
+        End If
+        Set prev = ws
+    Next nm
+    
+    ' 2. ファイルにないシートを削除する
+    For i = wb.Worksheets.Count To 1 Step -1
+        If Not names.Exists(wb.Worksheets(i).Name) Then wb.Worksheets(i).Delete
+    Next i
+    
+    ' 3. 書き込み
+    Set merges = New Collection
+    For i = 1 To UBound(lines)
+        If Len(lines(i)) > 0 Then
+            cols = Split(lines(i), vbTab)
+            If UBound(cols) >= 2 Then
+                Set ws = wb.Worksheets(cols(0))
+                Select Case cols(1)
+                
+                Case "#COL"
+                    ws.Columns(CLng(cols(2))).ColumnWidth = Val(cols(3))
+                
+                Case "#ROW"
+                    ws.Rows(CLng(cols(2))).RowHeight = Val(cols(3))
+                
+                Case Else
+                    Set rng = ws.Range(cols(1))
+                    fml = Replace(cols(2), "\n", vbLf)
+                    
+                    If UBound(cols) >= 6 Then
+                        If Left(fml, 1) <> "=" Then rng.NumberFormat = cols(6)
+                    End If
+                    rng.Formula = fml
+                    If UBound(cols) >= 6 Then
+                        If Left(fml, 1) = "=" Then rng.NumberFormat = cols(6)
+                    End If
+                    
+                    If UBound(cols) >= 4 Then
+                        If cols(4) <> "" Then rng.Interior.Color = CLng(cols(4))
+                    End If
+                    
+                    If UBound(cols) >= 5 Then
+                        parts = Split(cols(5), "|")
+                        For k = 0 To UBound(parts)
+                            If parts(k) <> "" Then
+                                p = Split(parts(k), ",")
+                                With rng.Borders(xlEdgeLeft + k)
+                                    .LineStyle = CLng(p(0))
+                                    .Weight = CLng(p(1))
+                                    .Color = CLng(p(2))
+                                End With
+                            End If
+                        Next k
+                    End If
+                    
+                    On Error Resume Next
+                    If UBound(cols) >= 7 Then
+                        p = Split(cols(7), "|")
+                        If UBound(p) >= 5 Then
+                            With rng.Font
+                                If p(0) <> "" Then .Name = p(0)
+                                If p(1) <> "" Then .Size = Val(p(1))
+                                If p(2) <> "" Then .Bold = CBool(p(2))
+                                If p(3) <> "" Then .Italic = CBool(p(3))
+                                If p(4) <> "" Then .Underline = CLng(p(4))
+                                If p(5) <> "" Then .Color = CLng(p(5))
+                            End With
+                        End If
+                    End If
+                    If UBound(cols) >= 8 Then
+                        p = Split(cols(8), "|")
+                        If UBound(p) >= 3 Then
+                            If p(0) <> "" Then rng.HorizontalAlignment = CLng(p(0))
+                            If p(1) <> "" Then rng.VerticalAlignment = CLng(p(1))
+                            If p(2) <> "" Then rng.WrapText = CBool(p(2))
+                            If p(3) <> "" Then rng.IndentLevel = CLng(p(3))
+                        End If
+                    End If
+                    On Error GoTo 0
+                    
+                    If UBound(cols) >= 9 Then
+                        If cols(9) <> "" Then merges.Add cols(0) & vbTab & cols(9)
+                    End If
+                End Select
+            End If
+        End If
+    Next i
+    
+    ' 4. セルを結合する
+    For Each m In merges
+        a = Split(m, vbTab)
+        wb.Worksheets(a(0)).Range(a(1)).Merge
+    Next m
+    
+    Application.DisplayAlerts = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    wb.Worksheets(1).Activate
+    MsgBox "復元完了"
+End Sub
