@@ -1,53 +1,72 @@
-Option VBASupport 1
+' LibreOffice Calc 用：Excelから書き出したタブ区切りテキストからブックを復元する
+' （VBA互換を使わず UNO API で直接書き込む版。Option VBASupport は不要）
 
 Sub RestoreFromText()
-    Dim doc As Object, sheets As Object
-    Dim fp As Object, files() As String, sUrl As String
+    Dim doc As Object, sheets As Object, sh As Object, cell As Object, rng As Object
+    Dim fp As Object, files, sUrl As String
     Dim sfa As Object, inp As Object, tis As Object
-    Dim lines() As String, nLines As Long
+    Dim lines, nLines As Long
     Dim names() As String, nNames As Long
     Dim merges() As String, nMerges As Long
-    Dim oldNames() As String
-    Dim cols() As String, parts() As String, p() As String, a() As String
-    Dim i As Long, k As Long, fml As String
-    Dim ws As Object, rng As Object
-    
+    Dim oldNames, cols, a
+    Dim i As Long, curLine As Long, locked As Boolean
+    Dim nf As Object, msg As String
+    Dim loc As New com.sun.star.lang.Locale
+    Dim si, phase As String
+    phase = "開始"
+
+    On Error GoTo ErrH
+
     doc = ThisComponent
-    
-    ' ---- ファイルを選ぶ（LibreOfficeのダイアログ）----
+    If Not doc.supportsService("com.sun.star.sheet.SpreadsheetDocument") Then
+        MsgBox "Calcのファイルを前面に出してから実行してください。", 48
+        Exit Sub
+    End If
+
+    ' ---- ファイル選択 ----
     fp = CreateUnoService("com.sun.star.ui.dialogs.FilePicker")
     fp.appendFilter("テキスト (*.txt;*.tsv)", "*.txt;*.tsv")
     If fp.execute() <> 1 Then Exit Sub
     files = fp.getFiles()
     sUrl = files(0)
-    
-    If MsgBox("このブックの内容を選択したファイルの内容で置き換えます。よろしいですか？", _
-              1 + 48) <> 1 Then Exit Sub   ' 1=OK/キャンセル, 48=警告アイコン
-    
-    ' ---- UTF-8で1行ずつ読み込む（CRLF／LFの違いは自動で吸収される）----
-    sfa = CreateUnoService("com.sun.star.ucb.SimpleFileAccess")
-    inp = sfa.openFileRead(sUrl)
-    tis = CreateUnoService("com.sun.star.io.TextInputStream")
-    tis.setInputStream(inp)
-    tis.setEncoding("UTF-8")
-    ReDim lines(0 To 1023)
-    nLines = 0
-    Do While Not tis.isEOF()
-        If nLines > UBound(lines) Then ReDim Preserve lines(0 To UBound(lines) * 2 + 1)
-        lines(nLines) = tis.readLine()
-        nLines = nLines + 1
-    Loop
-    tis.closeInput()
-    
-    ' ---- シート名を出てくる順に集める（Dictionaryの代わり）----
+
+    If MsgBox("このブックの内容を選択したファイルの内容で置き換えます。よろしいですか？", 1 + 48) <> 1 Then Exit Sub
+
+    ' ---- 読み込み（1行目が "Sheet<TAB>Address" になる文字コードを自動判定）----
+    si = StatusStart(doc, "ファイル読み込み中")
+    Dim enc As String, diag As String, okEnc As Boolean
+    okEnc = False
+    ' 1) バイト列を直接読んで UTF-8 / UTF-16 として変換
+    lines = ReadLinesRaw(sUrl, enc, diag)
+    nLines = UBound(lines) + 1
+    If nLines > 0 Then okEnc = (Left(lines(0), 13) = "Sheet" & Chr(9) & "Address")
+    ' 2) だめなら Basic 標準の読み込み（Windowsの既定＝Shift_JIS）で再挑戦
+    If Not okEnc Then
+        lines = ReadLinesNative(sUrl)
+        nLines = UBound(lines) + 1
+        enc = "Shift_JIS(標準)"
+        If nLines > 0 Then okEnc = (Left(lines(0), 13) = "Sheet" & Chr(9) & "Address")
+    End If
+    If Not okEnc Then
+        StatusEnd(si)
+        msg = "ファイルの1行目を正しく読めませんでした。" & Chr(10) & diag
+        If nLines > 0 Then msg = msg & Chr(10) & "標準読み込みの1行目: " & Left(lines(0), 40)
+        MsgBox msg, 16
+        Exit Sub
+    End If
+    phase = "読み込み完了（" & enc & " / " & nLines & "行）"
+
+    ' ---- シート名を出現順に集める ----
     ReDim names(0 To 63)
     nNames = 0
-    For i = 1 To nLines - 1            ' 0行目（見出し）は飛ばす
+    For i = 1 To nLines - 1
         If Len(lines(i)) > 0 Then
             cols = Split(lines(i), Chr(9))
             If UBound(cols) >= 2 Then
                 If IndexOf(names, nNames, cols(0)) < 0 Then
-                    If nNames > UBound(names) Then ReDim Preserve names(0 To UBound(names) * 2 + 1)
+                    If nNames > UBound(names) Then
+                        ReDim Preserve names(0 To UBound(names) * 2 + 1)
+                    End If
                     names(nNames) = cols(0)
                     nNames = nNames + 1
                 End If
@@ -58,12 +77,28 @@ Sub RestoreFromText()
         MsgBox "ファイルにデータがありません。", 48
         Exit Sub
     End If
-    
-    doc.lockControllers()
-    doc.addActionLock()
+
+    ' 作るシート名を確認（おかしな名前が混ざっていればここで分かる）
+    msg = "文字コード: " & enc & " / " & nLines & "行" & Chr(10) & "作成するシート（" & nNames & "）:" & Chr(10)
+    For i = 0 To nNames - 1
+        If i < 15 Then msg = msg & "・[" & names(i) & "]  " & CharCodes(names(i), 6) & Chr(10)
+    Next i
+    If MsgBox(msg & Chr(10) & "この内容で続けますか？", 1 + 32) <> 1 Then
+        StatusEnd(si)
+        Exit Sub
+    End If
+
+    nf = doc.getNumberFormats()
+    loc.Language = "en"
+    loc.Country = "US"                ' Excel形式の書式コードを英語ロケールで解釈
+
+    ' 診断のため画面ロックはしない（進み具合が見えるように）
     doc.enableAutomaticCalculation(False)
-    
-    ' ---- シートを作り直す（既存シートは退避名に変えてから削除）----
+    locked = True
+
+    ' ---- シートを作り直す ----
+    StatusText(si, "シート作成中", 0)
+    phase = "シート作成"
     sheets = doc.getSheets()
     oldNames = sheets.getElementNames()
     For i = 0 To UBound(oldNames)
@@ -75,87 +110,33 @@ Sub RestoreFromText()
     For i = 0 To UBound(oldNames)
         sheets.removeByName("__old_" & i & "__")
     Next i
-    
-    ' ---- 書き込み（ここからはVBA互換モードでExcelと同じ書き方）----
+
+    ' ---- 書き込み ----
     ReDim merges(0 To 255)
     nMerges = 0
+    phase = "セル書き込み"
     For i = 1 To nLines - 1
+        curLine = i
+        If i Mod 25 = 0 Then
+            StatusText(si, "書き込み中: " & i & " / " & (nLines - 1) & "行", Int(i * 100 / nLines))
+        End If
         If Len(lines(i)) > 0 Then
             cols = Split(lines(i), Chr(9))
             If UBound(cols) >= 2 Then
-                Set ws = ActiveWorkbook.Worksheets(cols(0))
+                sh = sheets.getByName(cols(0))
                 Select Case cols(1)
-                
                 Case "#COL"
-                    ws.Columns(CLng(cols(2))).ColumnWidth = Val(cols(3))
-                
+                    sh.getColumns().getByIndex(CLng(cols(2)) - 1).Width = ColWidth(Val(cols(3)))
                 Case "#ROW"
-                    ws.Rows(CLng(cols(2))).RowHeight = Val(cols(3))
-                
+                    sh.getRows().getByIndex(CLng(cols(2)) - 1).Height = CLng(Val(cols(3)) * 2540 / 72)
                 Case Else
-                    Set rng = ws.Range(cols(1))
-                    fml = Replace(cols(2), "\n", Chr(10))
-                    
-                    On Error Resume Next   ' 一部の書式が変換できなくても続ける
-                    If UBound(cols) >= 6 Then
-                        If Left(fml, 1) <> "=" Then rng.NumberFormat = cols(6)
-                    End If
-                    rng.Formula = fml
-                    If UBound(cols) >= 6 Then
-                        If Left(fml, 1) = "=" Then rng.NumberFormat = cols(6)
-                    End If
-                    
-                    ' 塗りつぶし
-                    If UBound(cols) >= 4 Then
-                        If cols(4) <> "" Then rng.Interior.Color = CLng(cols(4))
-                    End If
-                    
-                    ' 罫線（左|上|下|右）
-                    If UBound(cols) >= 5 Then
-                        parts = Split(cols(5), "|")
-                        For k = 0 To UBound(parts)
-                            If parts(k) <> "" Then
-                                p = Split(parts(k), ",")
-                                With rng.Borders(7 + k)   ' 7=左, 8=上, 9=下, 10=右
-                                    .LineStyle = CLng(p(0))
-                                    .Weight = CLng(p(1))
-                                    .Color = CLng(p(2))
-                                End With
-                            End If
-                        Next k
-                    End If
-                    
-                    ' フォント
-                    If UBound(cols) >= 7 Then
-                        p = Split(cols(7), "|")
-                        If UBound(p) >= 5 Then
-                            With rng.Font
-                                If p(0) <> "" Then .Name = p(0)
-                                If p(1) <> "" Then .Size = Val(p(1))
-                                If p(2) <> "" Then .Bold = CBool(p(2))
-                                If p(3) <> "" Then .Italic = CBool(p(3))
-                                If p(4) <> "" Then .Underline = CLng(p(4))
-                                If p(5) <> "" Then .Color = CLng(p(5))
-                            End With
-                        End If
-                    End If
-                    
-                    ' 配置
-                    If UBound(cols) >= 8 Then
-                        p = Split(cols(8), "|")
-                        If UBound(p) >= 3 Then
-                            If p(0) <> "" Then rng.HorizontalAlignment = CLng(p(0))
-                            If p(1) <> "" Then rng.VerticalAlignment = CLng(p(1))
-                            If p(2) <> "" Then rng.WrapText = CBool(p(2))
-                            If p(3) <> "" Then rng.IndentLevel = CLng(p(3))
-                        End If
-                    End If
-                    On Error GoTo 0
-                    
-                    ' 結合セルは最後にまとめて処理
+                    cell = sh.getCellRangeByName(cols(1))
+                    ApplyCell(nf, loc, cell, cols)
                     If UBound(cols) >= 9 Then
                         If cols(9) <> "" Then
-                            If nMerges > UBound(merges) Then ReDim Preserve merges(0 To UBound(merges) * 2 + 1)
+                            If nMerges > UBound(merges) Then
+                                ReDim Preserve merges(0 To UBound(merges) * 2 + 1)
+                            End If
                             merges(nMerges) = cols(0) & Chr(9) & cols(9)
                             nMerges = nMerges + 1
                         End If
@@ -164,21 +145,431 @@ Sub RestoreFromText()
             End If
         End If
     Next i
-    
-    ' ---- セルを結合する ----
-    On Error Resume Next
+    curLine = 0
+
+    ' ---- セル結合 ----
     For i = 0 To nMerges - 1
         a = Split(merges(i), Chr(9))
-        ActiveWorkbook.Worksheets(a(0)).Range(a(1)).Merge
+        rng = sheets.getByName(a(0)).getCellRangeByName(a(1))
+        rng.merge(True)
     Next i
-    On Error GoTo 0
-    
+
+    phase = "再計算"
+    StatusText(si, "再計算中", 100)
     doc.enableAutomaticCalculation(True)
     doc.calculateAll()
-    doc.removeActionLock()
-    doc.unlockControllers()
-    MsgBox "復元完了"
+    locked = False
+    StatusEnd(si)
+    MsgBox "復元完了（" & nNames & "シート / " & (nLines - 1) & "行）"
+    Exit Sub
+
+ErrH:
+    msg = "エラー " & Err & ": " & Error$ & Chr(10) & "マクロの行: " & Erl & Chr(10) & "段階: " & phase
+    If curLine > 0 Then msg = msg & Chr(10) & "テキスト " & (curLine + 1) & "行目: " & Left(lines(curLine), 80)
+    On Error Resume Next
+    If locked Then doc.enableAutomaticCalculation(True)
+    StatusEnd(si)
+    MsgBox msg, 16
 End Sub
+
+' ---- ステータスバー表示（取得できない環境では何もしない）----
+Function StatusStart(doc, txt As String)
+    Dim s
+    On Error GoTo NoBar
+    s = doc.getCurrentController().getFrame().createStatusIndicator()
+    s.start(txt, 100)
+    StatusStart = s
+    Exit Function
+NoBar:
+    StatusStart = Empty
+End Function
+
+Sub StatusText(si, txt As String, v As Long)
+    On Error Resume Next
+    If IsEmpty(si) Or IsNull(si) Then Exit Sub
+    si.setText(txt)
+    si.setValue(v)
+End Sub
+
+Sub StatusEnd(si)
+    On Error Resume Next
+    If IsEmpty(si) Or IsNull(si) Then Exit Sub
+    si.end()
+End Sub
+
+' ---- 1セル分の内容・書式を設定 ----
+Sub ApplyCell(nf, loc, cell, cols)
+    Dim fml As String, parts, p, k As Long, key As Long, bl, w As Long
+
+    ' 表示形式（中身より先に設定）
+    If UBound(cols) >= 6 Then
+        If cols(6) <> "" Then
+            key = GetFormatKey(nf, loc, cols(6))
+            If key >= 0 Then cell.NumberFormat = key
+        End If
+    End If
+
+    ' 中身
+    fml = Replace(cols(2), "\n", Chr(10))
+    If Left(fml, 1) = "=" Then
+        cell.setFormula(XlToCalc(fml))
+    ElseIf fml <> "" Then
+        If IsNum(fml) Then
+            cell.setValue(Val(fml))
+        Else
+            cell.setString(fml)
+        End If
+    End If
+
+    ' 塗りつぶし
+    If UBound(cols) >= 4 Then
+        If cols(4) <> "" Then cell.CellBackColor = BgrToRgb(CLng(cols(4)))
+    End If
+
+    ' 罫線（左|上|下|右）
+    If UBound(cols) >= 5 Then
+        If cols(5) <> "" Then
+            parts = Split(cols(5), "|")
+            For k = 0 To UBound(parts)
+                If parts(k) <> "" Then
+                    p = Split(parts(k), ",")
+                    bl = MakeBorder(CLng(p(0)), CLng(p(1)), CLng(p(2)))
+                    Select Case k
+                        Case 0: cell.LeftBorder = bl
+                        Case 1: cell.TopBorder = bl
+                        Case 2: cell.BottomBorder = bl
+                        Case 3: cell.RightBorder = bl
+                    End Select
+                End If
+            Next k
+        End If
+    End If
+
+    ' フォント（名前|サイズ|太字|斜体|下線|色）
+    If UBound(cols) >= 7 Then
+        p = Split(cols(7), "|")
+        If UBound(p) >= 5 Then
+            If p(0) <> "" Then
+                cell.CharFontName = p(0)
+                cell.CharFontNameAsian = p(0)
+            End If
+            If p(1) <> "" Then
+                cell.CharHeight = Val(p(1))
+                cell.CharHeightAsian = Val(p(1))
+            End If
+            If p(2) <> "" Then
+                If LCase(p(2)) = "true" Then w = 150 Else w = 100
+                cell.CharWeight = w
+                cell.CharWeightAsian = w
+            End If
+            If p(3) <> "" Then
+                If LCase(p(3)) = "true" Then w = 2 Else w = 0   ' 2=ITALIC, 0=NONE
+                cell.CharPosture = w
+                cell.CharPostureAsian = w
+            End If
+            If p(4) <> "" Then
+                Select Case CLng(p(4))
+                    Case 2: cell.CharUnderline = 1        ' 一重
+                    Case -4119: cell.CharUnderline = 2    ' 二重
+                    Case Else: cell.CharUnderline = 0
+                End Select
+            End If
+            If p(5) <> "" Then cell.CharColor = BgrToRgb(CLng(p(5)))
+        End If
+    End If
+
+    ' 配置（横|縦|折り返し|インデント）
+    If UBound(cols) >= 8 Then
+        p = Split(cols(8), "|")
+        If UBound(p) >= 3 Then
+            If p(0) <> "" Then
+                Select Case CLng(p(0))
+                    Case -4131: cell.HoriJustify = 1   ' 左
+                    Case -4108: cell.HoriJustify = 2   ' 中央
+                    Case -4152: cell.HoriJustify = 3   ' 右
+                    Case -4130: cell.HoriJustify = 4   ' 両端揃え
+                    Case Else:  cell.HoriJustify = 0   ' 標準
+                End Select
+            End If
+            If p(1) <> "" Then
+                Select Case CLng(p(1))
+                    Case -4160: cell.VertJustify = 1   ' 上
+                    Case -4108: cell.VertJustify = 2   ' 中央
+                    Case -4107: cell.VertJustify = 3   ' 下
+                    Case Else:  cell.VertJustify = 0
+                End Select
+            End If
+            If p(2) <> "" Then cell.IsTextWrapped = (LCase(p(2)) = "true")
+            If p(3) <> "" Then
+                If CLng(p(3)) > 0 Then cell.ParaIndent = CLng(p(3)) * 353
+            End If
+        End If
+    End If
+End Sub
+
+' Excel形式の数式 → Calc API形式（区切り , → ;、シート参照 ! → .）
+Function XlToCalc(f As String) As String
+    Dim r As String, c As String, i As Long, inDq As Boolean, inSq As Boolean
+    r = ""
+    For i = 1 To Len(f)
+        c = Mid(f, i, 1)
+        If inDq Then
+            r = r & c
+            If c = """" Then inDq = False
+        ElseIf inSq Then
+            r = r & c
+            If c = "'" Then inSq = False
+        Else
+            Select Case c
+                Case """": inDq = True: r = r & c
+                Case "'": inSq = True: r = r & c
+                Case ",": r = r & ";"
+                Case "!": r = r & "."
+                Case Else: r = r & c
+            End Select
+        End If
+    Next i
+    XlToCalc = r
+End Function
+
+' 書式コードのキーを取得（なければ登録、解釈できなければ -1）
+Function GetFormatKey(nf, loc, code As String) As Long
+    Dim k As Long
+    On Error GoTo Fail
+    k = nf.queryKey(code, loc, False)
+    If k = -1 Then k = nf.addNew(code, loc)
+    GetFormatKey = k
+    Exit Function
+Fail:
+    GetFormatKey = -1
+End Function
+
+' Excelの罫線指定 → BorderLine2
+Function MakeBorder(ls As Long, wt As Long, col As Long)
+    Dim b As New com.sun.star.table.BorderLine2
+    If ls = -4142 Or ls = 0 Then
+        MakeBorder = b                 ' 線なし
+        Exit Function
+    End If
+    b.Color = BgrToRgb(col)
+    Select Case wt
+        Case 1: b.OuterLineWidth = 9       ' 極細
+        Case -4138: b.OuterLineWidth = 53  ' 中
+        Case 4: b.OuterLineWidth = 88      ' 太
+        Case Else: b.OuterLineWidth = 26   ' 細
+    End Select
+    b.LineWidth = b.OuterLineWidth
+    Select Case ls
+        Case -4115: b.LineStyle = com.sun.star.table.BorderLineStyle.DASHED
+        Case -4118: b.LineStyle = com.sun.star.table.BorderLineStyle.DOTTED
+        Case -4119: b.LineStyle = com.sun.star.table.BorderLineStyle.DOUBLE
+        Case Else:  b.LineStyle = com.sun.star.table.BorderLineStyle.SOLID
+    End Select
+    MakeBorder = b
+End Function
+
+' Excelの色値（BGR）→ RGB
+Function BgrToRgb(c As Long) As Long
+    BgrToRgb = RGB(c And 255, (c \ 256) And 255, (c \ 65536) And 255)
+End Function
+
+' Excelの列幅（文字数）→ 1/100 mm（近似。合わなければ係数 8 を調整）
+Function ColWidth(w As Double) As Long
+    ColWidth = CLng(Int(w * 8 + 5) * 2540 / 96)
+End Function
+
+' 数値として書き込むべき文字列か
+Function IsNum(s As String) As Boolean
+    Dim i As Long, c As String, dots As Long, digits As Long
+    IsNum = False
+    If s = "" Then Exit Function
+    For i = 1 To Len(s)
+        c = Mid(s, i, 1)
+        If c >= "0" And c <= "9" Then
+            digits = digits + 1
+        ElseIf c = "." Then
+            dots = dots + 1
+        ElseIf c = "-" And i = 1 Then
+            ' 先頭のマイナスは可
+        Else
+            Exit Function
+        End If
+    Next i
+    IsNum = (digits > 0 And dots <= 1)
+End Function
+
+' ファイルをバイト列で読み、BOMで UTF-8 / UTF-16LE / UTF-16BE を判定して行に分ける
+' 戻り値は行数。UTF-8として不正なバイトが多ければ 0 を返す
+Function ReadLinesRaw(sUrl As String, enc As String, diag As String)
+    Dim lines() As String
+    Dim sfa As Object, inp As Object
+    Dim size As Long, bt() As Integer, buf(), got As Long, pos As Long, j As Long
+    Dim i As Long, b As Long, b2 As Long, b3 As Long, b4 As Long, cp As Long
+    Dim n As Long, ln As String, bad As Long, mode As Integer
+
+    sfa = CreateUnoService("com.sun.star.ucb.SimpleFileAccess")
+    size = sfa.getSize(sUrl)
+    diag = "ファイルサイズ: " & size & " バイト"
+    ReadLinesRaw = Array()
+    If size <= 0 Then Exit Function
+
+    ' --- 全バイトを読む（符号付きなので 0〜255 に直す）---
+    ReDim bt(0 To size - 1)
+    inp = sfa.openFileRead(sUrl)
+    pos = 0
+    Do
+        got = inp.readBytes(buf, 65536)
+        If got <= 0 Then Exit Do
+        For j = 0 To got - 1
+            If pos < size Then
+                b = buf(j)
+                If b < 0 Then b = b + 256
+                bt(pos) = b
+                pos = pos + 1
+            End If
+        Next j
+    Loop While pos < size
+    inp.closeInput()
+    size = pos
+
+    diag = diag & Chr(10) & "先頭バイト: "
+    For i = 0 To 11
+        If i < size Then diag = diag & Right("0" & Hex(bt(i)), 2) & " "
+    Next i
+
+    ' --- 文字コード判定 ---
+    i = 0
+    mode = 8
+    If size >= 2 Then
+        If bt(0) = &HFF And bt(1) = &HFE Then mode = 16 : i = 2
+        If bt(0) = &HFE And bt(1) = &HFF Then mode = 17 : i = 2
+    End If
+    If mode = 8 And size >= 3 Then
+        If bt(0) = &HEF And bt(1) = &HBB And bt(2) = &HBF Then i = 3
+    End If
+    ' BOMなしUTF-16LE（"S",0,"h",0 のパターン）
+    If mode = 8 And i = 0 And size >= 4 Then
+        If bt(1) = 0 And bt(3) = 0 Then mode = 16
+    End If
+    Select Case mode
+        Case 8: enc = "UTF-8"
+        Case 16: enc = "UTF-16LE"
+        Case 17: enc = "UTF-16BE"
+    End Select
+
+    ReDim lines(0 To 1023)
+    n = 0
+    ln = ""
+    Do While i < size
+        b = bt(i)
+        If mode = 8 Then
+            If b < &H80 Then
+                cp = b : i = i + 1
+            ElseIf b >= &HE0 And b < &HF0 And i + 2 < size Then
+                b2 = bt(i + 1) : b3 = bt(i + 2)
+                cp = (b And 15) * 4096 + (b2 And 63) * 64 + (b3 And 63)
+                i = i + 3
+            ElseIf b >= &HC0 And b < &HE0 And i + 1 < size Then
+                b2 = bt(i + 1)
+                cp = (b And 31) * 64 + (b2 And 63)
+                i = i + 2
+            ElseIf b >= &HF0 And i + 3 < size Then
+                b2 = bt(i + 1) : b3 = bt(i + 2) : b4 = bt(i + 3)
+                cp = (b And 7) * 262144 + (b2 And 63) * 4096 + (b3 And 63) * 64 + (b4 And 63)
+                i = i + 4
+            Else
+                bad = bad + 1 : cp = -1 : i = i + 1
+            End If
+        Else
+            If i + 1 >= size Then Exit Do
+            If mode = 16 Then cp = bt(i) + bt(i + 1) * 256 Else cp = bt(i) * 256 + bt(i + 1)
+            i = i + 2
+        End If
+
+        If cp = 10 Then
+            If n > UBound(lines) Then
+                ReDim Preserve lines(0 To UBound(lines) * 2 + 1)
+            End If
+            lines(n) = ln
+            n = n + 1
+            ln = ""
+        ElseIf cp = 13 Or cp = 65279 Or cp < 0 Then
+            ' CR・BOM・不正バイトは捨てる
+        ElseIf cp > 65535 Then
+            cp = cp - 65536
+            ln = ln & Chr(55296 + (cp \ 1024)) & Chr(56320 + (cp Mod 1024))
+        Else
+            ln = ln & Chr(cp)
+        End If
+    Loop
+    If ln <> "" Then
+        If n > UBound(lines) Then
+            ReDim Preserve lines(0 To UBound(lines) * 2 + 1)
+        End If
+        lines(n) = ln
+        n = n + 1
+    End If
+
+    diag = diag & Chr(10) & "判定: " & enc & " / 行数: " & n & " / 不正バイト: " & bad
+    If mode = 8 And bad > 10 Then
+        ReadLinesRaw = Array()    ' UTF-8ではない（Shift_JISの可能性）
+    ElseIf n = 0 Then
+        ReadLinesRaw = Array()
+    Else
+        ReDim Preserve lines(0 To n - 1)
+        ReadLinesRaw = lines
+    End If
+End Function
+
+' Basic標準の読み込み（OSの既定の文字コード。日本語WindowsならShift_JIS）
+Function ReadLinesNative(sUrl As String)
+    Dim fn As Integer, n As Long, ln As String, lines() As String
+    ReDim lines(0 To 1023)
+    n = 0
+    fn = FreeFile()
+    Open ConvertFromURL(sUrl) For Input As #fn
+    Do While Not EOF(fn)
+        Line Input #fn, ln
+        If n > UBound(lines) Then
+            ReDim Preserve lines(0 To UBound(lines) * 2 + 1)
+        End If
+        lines(n) = CleanLine(ln)
+        n = n + 1
+        If n > 100000 Then Exit Do
+    Loop
+    Close #fn
+    If n = 0 Then
+        ReadLinesNative = Array()
+    Else
+        ReDim Preserve lines(0 To n - 1)
+        ReadLinesNative = lines
+    End If
+End Function
+
+' BOM・NUL・CR など見えない制御文字を取り除く（タブは残す）
+Function CleanLine(s As String) As String
+    Dim r As String, i As Long, c As Long
+    r = ""
+    For i = 1 To Len(s)
+        c = Asc(Mid(s, i, 1))
+        If c < 0 Then c = c + 65536
+        If c = 9 Or (c >= 32 And c <> 65279 And c <> 65533) Then r = r & Mid(s, i, 1)
+    Next i
+    CleanLine = r
+End Function
+
+' 文字列の先頭n文字の文字コード（診断用）
+Function CharCodes(s As String, n As Long) As String
+    Dim r As String, i As Long, c As Long
+    r = ""
+    For i = 1 To Len(s)
+        If i > n Then Exit For
+        c = Asc(Mid(s, i, 1))
+        If c < 0 Then c = c + 65536
+        r = r & Hex(c) & " "
+    Next i
+    CharCodes = r
+End Function
 
 ' 配列の中で文字列の位置を返す（なければ -1）
 Function IndexOf(arr() As String, n As Long, s As String) As Long
