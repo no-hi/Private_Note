@@ -1,0 +1,193 @@
+Option VBASupport 1
+
+Sub RestoreFromText()
+    Dim doc As Object, sheets As Object
+    Dim fp As Object, files() As String, sUrl As String
+    Dim sfa As Object, inp As Object, tis As Object
+    Dim lines() As String, nLines As Long
+    Dim names() As String, nNames As Long
+    Dim merges() As String, nMerges As Long
+    Dim oldNames() As String
+    Dim cols() As String, parts() As String, p() As String, a() As String
+    Dim i As Long, k As Long, fml As String
+    Dim ws As Object, rng As Object
+    
+    doc = ThisComponent
+    
+    ' ---- ファイルを選ぶ（LibreOfficeのダイアログ）----
+    fp = CreateUnoService("com.sun.star.ui.dialogs.FilePicker")
+    fp.appendFilter("テキスト (*.txt;*.tsv)", "*.txt;*.tsv")
+    If fp.execute() <> 1 Then Exit Sub
+    files = fp.getFiles()
+    sUrl = files(0)
+    
+    If MsgBox("このブックの内容を選択したファイルの内容で置き換えます。よろしいですか？", _
+              1 + 48) <> 1 Then Exit Sub   ' 1=OK/キャンセル, 48=警告アイコン
+    
+    ' ---- UTF-8で1行ずつ読み込む（CRLF／LFの違いは自動で吸収される）----
+    sfa = CreateUnoService("com.sun.star.ucb.SimpleFileAccess")
+    inp = sfa.openFileRead(sUrl)
+    tis = CreateUnoService("com.sun.star.io.TextInputStream")
+    tis.setInputStream(inp)
+    tis.setEncoding("UTF-8")
+    ReDim lines(0 To 1023)
+    nLines = 0
+    Do While Not tis.isEOF()
+        If nLines > UBound(lines) Then ReDim Preserve lines(0 To UBound(lines) * 2 + 1)
+        lines(nLines) = tis.readLine()
+        nLines = nLines + 1
+    Loop
+    tis.closeInput()
+    
+    ' ---- シート名を出てくる順に集める（Dictionaryの代わり）----
+    ReDim names(0 To 63)
+    nNames = 0
+    For i = 1 To nLines - 1            ' 0行目（見出し）は飛ばす
+        If Len(lines(i)) > 0 Then
+            cols = Split(lines(i), Chr(9))
+            If UBound(cols) >= 2 Then
+                If IndexOf(names, nNames, cols(0)) < 0 Then
+                    If nNames > UBound(names) Then ReDim Preserve names(0 To UBound(names) * 2 + 1)
+                    names(nNames) = cols(0)
+                    nNames = nNames + 1
+                End If
+            End If
+        End If
+    Next i
+    If nNames = 0 Then
+        MsgBox "ファイルにデータがありません。", 48
+        Exit Sub
+    End If
+    
+    doc.lockControllers()
+    doc.addActionLock()
+    doc.enableAutomaticCalculation(False)
+    
+    ' ---- シートを作り直す（既存シートは退避名に変えてから削除）----
+    sheets = doc.getSheets()
+    oldNames = sheets.getElementNames()
+    For i = 0 To UBound(oldNames)
+        sheets.getByName(oldNames(i)).setName("__old_" & i & "__")
+    Next i
+    For i = 0 To nNames - 1
+        sheets.insertNewByName(names(i), i)
+    Next i
+    For i = 0 To UBound(oldNames)
+        sheets.removeByName("__old_" & i & "__")
+    Next i
+    
+    ' ---- 書き込み（ここからはVBA互換モードでExcelと同じ書き方）----
+    ReDim merges(0 To 255)
+    nMerges = 0
+    For i = 1 To nLines - 1
+        If Len(lines(i)) > 0 Then
+            cols = Split(lines(i), Chr(9))
+            If UBound(cols) >= 2 Then
+                Set ws = ActiveWorkbook.Worksheets(cols(0))
+                Select Case cols(1)
+                
+                Case "#COL"
+                    ws.Columns(CLng(cols(2))).ColumnWidth = Val(cols(3))
+                
+                Case "#ROW"
+                    ws.Rows(CLng(cols(2))).RowHeight = Val(cols(3))
+                
+                Case Else
+                    Set rng = ws.Range(cols(1))
+                    fml = Replace(cols(2), "\n", Chr(10))
+                    
+                    On Error Resume Next   ' 一部の書式が変換できなくても続ける
+                    If UBound(cols) >= 6 Then
+                        If Left(fml, 1) <> "=" Then rng.NumberFormat = cols(6)
+                    End If
+                    rng.Formula = fml
+                    If UBound(cols) >= 6 Then
+                        If Left(fml, 1) = "=" Then rng.NumberFormat = cols(6)
+                    End If
+                    
+                    ' 塗りつぶし
+                    If UBound(cols) >= 4 Then
+                        If cols(4) <> "" Then rng.Interior.Color = CLng(cols(4))
+                    End If
+                    
+                    ' 罫線（左|上|下|右）
+                    If UBound(cols) >= 5 Then
+                        parts = Split(cols(5), "|")
+                        For k = 0 To UBound(parts)
+                            If parts(k) <> "" Then
+                                p = Split(parts(k), ",")
+                                With rng.Borders(7 + k)   ' 7=左, 8=上, 9=下, 10=右
+                                    .LineStyle = CLng(p(0))
+                                    .Weight = CLng(p(1))
+                                    .Color = CLng(p(2))
+                                End With
+                            End If
+                        Next k
+                    End If
+                    
+                    ' フォント
+                    If UBound(cols) >= 7 Then
+                        p = Split(cols(7), "|")
+                        If UBound(p) >= 5 Then
+                            With rng.Font
+                                If p(0) <> "" Then .Name = p(0)
+                                If p(1) <> "" Then .Size = Val(p(1))
+                                If p(2) <> "" Then .Bold = CBool(p(2))
+                                If p(3) <> "" Then .Italic = CBool(p(3))
+                                If p(4) <> "" Then .Underline = CLng(p(4))
+                                If p(5) <> "" Then .Color = CLng(p(5))
+                            End With
+                        End If
+                    End If
+                    
+                    ' 配置
+                    If UBound(cols) >= 8 Then
+                        p = Split(cols(8), "|")
+                        If UBound(p) >= 3 Then
+                            If p(0) <> "" Then rng.HorizontalAlignment = CLng(p(0))
+                            If p(1) <> "" Then rng.VerticalAlignment = CLng(p(1))
+                            If p(2) <> "" Then rng.WrapText = CBool(p(2))
+                            If p(3) <> "" Then rng.IndentLevel = CLng(p(3))
+                        End If
+                    End If
+                    On Error GoTo 0
+                    
+                    ' 結合セルは最後にまとめて処理
+                    If UBound(cols) >= 9 Then
+                        If cols(9) <> "" Then
+                            If nMerges > UBound(merges) Then ReDim Preserve merges(0 To UBound(merges) * 2 + 1)
+                            merges(nMerges) = cols(0) & Chr(9) & cols(9)
+                            nMerges = nMerges + 1
+                        End If
+                    End If
+                End Select
+            End If
+        End If
+    Next i
+    
+    ' ---- セルを結合する ----
+    On Error Resume Next
+    For i = 0 To nMerges - 1
+        a = Split(merges(i), Chr(9))
+        ActiveWorkbook.Worksheets(a(0)).Range(a(1)).Merge
+    Next i
+    On Error GoTo 0
+    
+    doc.enableAutomaticCalculation(True)
+    doc.calculateAll()
+    doc.removeActionLock()
+    doc.unlockControllers()
+    MsgBox "復元完了"
+End Sub
+
+' 配列の中で文字列の位置を返す（なければ -1）
+Function IndexOf(arr() As String, n As Long, s As String) As Long
+    Dim j As Long
+    IndexOf = -1
+    For j = 0 To n - 1
+        If arr(j) = s Then
+            IndexOf = j
+            Exit Function
+        End If
+    Next j
+End Function
