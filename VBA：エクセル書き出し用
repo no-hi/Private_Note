@@ -1,0 +1,135 @@
+' ===== この宣言部分は、モジュールの一番上（どのSubよりも前）に置く =====
+Private Declare PtrSafe Function OpenClipboard Lib "user32" (ByVal hwnd As LongPtr) As Long
+Private Declare PtrSafe Function EmptyClipboard Lib "user32" () As Long
+Private Declare PtrSafe Function CloseClipboard Lib "user32" () As Long
+Private Declare PtrSafe Function SetClipboardData Lib "user32" (ByVal wFormat As Long, ByVal hMem As LongPtr) As LongPtr
+Private Declare PtrSafe Function GlobalAlloc Lib "kernel32" (ByVal wFlags As Long, ByVal dwBytes As LongPtr) As LongPtr
+Private Declare PtrSafe Function GlobalLock Lib "kernel32" (ByVal hMem As LongPtr) As LongPtr
+Private Declare PtrSafe Function GlobalUnlock Lib "kernel32" (ByVal hMem As LongPtr) As Long
+Private Declare PtrSafe Function GlobalFree Lib "kernel32" (ByVal hMem As LongPtr) As LongPtr
+Private Declare PtrSafe Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByVal dest As LongPtr, ByVal src As LongPtr, ByVal cb As LongPtr)
+
+Sub ExportToClipboard()
+    Dim ws As Worksheet, c As Range
+    Dim buf() As String, n As Long
+    Dim i As Long, lastR As Long, lastC As Long, mg As String
+    
+    ReDim buf(0 To 1023)
+    AddLine buf, n, "Sheet" & vbTab & "Address" & vbTab & "Formula" & vbTab & "Value" & vbTab & _
+                    "Fill" & vbTab & "Borders" & vbTab & "NumberFormat" & vbTab & _
+                    "Font" & vbTab & "Align" & vbTab & "Merge"
+    
+    For Each ws In ThisWorkbook.Worksheets
+        With ws.UsedRange
+            lastR = .Row + .Rows.Count - 1
+            lastC = .Column + .Columns.Count - 1
+        End With
+        
+        ' 列幅・行の高さ
+        For i = 1 To lastC
+            AddLine buf, n, ws.Name & vbTab & "#COL" & vbTab & i & vbTab & ws.Columns(i).ColumnWidth
+        Next i
+        For i = 1 To lastR
+            AddLine buf, n, ws.Name & vbTab & "#ROW" & vbTab & i & vbTab & ws.Rows(i).RowHeight
+        Next i
+        
+        ' セルごとの内容と書式
+        For Each c In ws.UsedRange
+            mg = ""
+            If c.MergeCells Then
+                If c.Address = c.MergeArea.Cells(1).Address Then mg = c.MergeArea.Address(0, 0)
+            End If
+            AddLine buf, n, ws.Name & vbTab & _
+                            c.Address(0, 0) & vbTab & _
+                            Clean(c.Formula) & vbTab & _
+                            Clean(c.Text) & vbTab & _
+                            GetFill(c) & vbTab & _
+                            GetBorders(c) & vbTab & _
+                            Clean(c.NumberFormat) & vbTab & _
+                            GetFont(c) & vbTab & _
+                            GetAlign(c) & vbTab & _
+                            mg
+        Next c
+    Next ws
+    
+    ReDim Preserve buf(0 To n - 1)
+    
+    ' クリップボードへコピー
+    If SetClipboardText(Join(buf, vbCrLf)) Then
+        MsgBox n & " 行をクリップボードにコピーしました。メモ帳などに貼り付けて保存してください。"
+    Else
+        MsgBox "クリップボードへのコピーに失敗しました。もう一度実行してください。", vbExclamation
+    End If
+End Sub
+
+' 文字列をクリップボードにコピーする（Unicode対応）
+Private Function SetClipboardText(ByVal s As String) As Boolean
+    Const GMEM_MOVEABLE As Long = &H2
+    Const CF_UNICODETEXT As Long = 13
+    Dim hMem As LongPtr, pMem As LongPtr, bytes As LongPtr
+    
+    bytes = (Len(s) + 1) * 2          ' 終端の文字分を含める
+    hMem = GlobalAlloc(GMEM_MOVEABLE, bytes)
+    If hMem = 0 Then Exit Function
+    pMem = GlobalLock(hMem)
+    If pMem = 0 Then GlobalFree hMem: Exit Function
+    CopyMemory pMem, StrPtr(s), bytes
+    GlobalUnlock hMem
+    
+    If OpenClipboard(0) = 0 Then GlobalFree hMem: Exit Function
+    EmptyClipboard
+    If SetClipboardData(CF_UNICODETEXT, hMem) = 0 Then
+        GlobalFree hMem
+    Else
+        SetClipboardText = True       ' 成功したらメモリはWindowsが管理する
+    End If
+    CloseClipboard
+End Function
+
+' 配列に1行追加する（足りなければ配列を広げる）
+Private Sub AddLine(buf() As String, n As Long, ByVal s As String)
+    If n > UBound(buf) Then ReDim Preserve buf(0 To UBound(buf) * 2 + 1)
+    buf(n) = s
+    n = n + 1
+End Sub
+
+Private Function GetFill(c As Range) As String
+    If c.Interior.Pattern <> xlNone Then GetFill = CStr(c.Interior.Color)
+End Function
+
+Private Function GetBorders(c As Range) As String
+    Dim k As Long, s As String, b As Border
+    For k = xlEdgeLeft To xlEdgeRight
+        Set b = c.Borders(k)
+        If k > xlEdgeLeft Then s = s & "|"
+        If Not IsNull(b.LineStyle) Then
+            If b.LineStyle <> xlLineStyleNone Then
+                s = s & b.LineStyle & "," & b.Weight & "," & b.Color
+            End If
+        End If
+    Next k
+    GetBorders = s
+End Function
+
+Private Function GetFont(c As Range) As String
+    With c.Font
+        GetFont = NzS(.Name) & "|" & NzS(.Size) & "|" & NzS(.Bold) & "|" & _
+                  NzS(.Italic) & "|" & NzS(.Underline) & "|" & NzS(.Color)
+    End With
+End Function
+
+Private Function GetAlign(c As Range) As String
+    GetAlign = NzS(c.HorizontalAlignment) & "|" & NzS(c.VerticalAlignment) & "|" & _
+               NzS(c.WrapText) & "|" & NzS(c.IndentLevel)
+End Function
+
+Private Function NzS(v As Variant) As String
+    If Not IsNull(v) Then NzS = CStr(v)
+End Function
+
+Private Function Clean(ByVal s As String) As String
+    s = Replace(s, vbTab, " ")
+    s = Replace(s, vbCrLf, "\n")
+    s = Replace(s, vbLf, "\n")
+    Clean = s
+End Function
